@@ -8,8 +8,9 @@ use CGI;
 use URI;
 use LWP::UserAgent;
 use Digest::MD5 qw(md5_hex);
+use JSON;
 
-our $VERSION = '0.01';
+our $VERSION = '0.50';
 
 __PACKAGE__->mk_accessors(qw/
     appid secret userhash appdata timeout token WSSID
@@ -17,6 +18,7 @@ __PACKAGE__->mk_accessors(qw/
 /);
 
 my $WSLOGIN_PREFIX = 'https://api.login.yahoo.com/WSLogin/V1/';
+my $JSON_RPC_ENDPOINT = 'http://mail.yahooapis.com/ws/mail/v1.1/jsonrpc';
 
 sub new {
     my ($class, %param) = @_;
@@ -57,36 +59,28 @@ sub validate_sig {
     $self->appdata($cgi->param('appdata'))   if defined $cgi->param('appdata');
     my $ts  = exists $param{ts}  ? $param{ts}  : $cgi->param('ts');
     my $sig = exists $param{sig} ? $param{sig} : $cgi->param('sig');
-    my ($relative_url, $get_sig) = $cgi->request_uri =~ /^(.+)&sig=(\w{32})$/;
+    my ($relative_url, $get_sig) = $ENV{'REQUEST_URI'} =~ /^(.+)&sig=(\w{32})$/;
     unless (defined $get_sig) {
-        $self->sig_validation_error(
-            "Invalid url may have been passed - relative_url: $relative_url"
-        );
-        return;
+        $self->{sig_validation_error} = "Invalid url may have been passed - relative_url:".$relative_url;
+        return 0;
     }
     if ($get_sig ne $sig) {
-        $self->sig_validation_error(
-            "Invalid sig may have been passed: $get_sig , $sig"
-        );
-        return;
+        $self->{sig_validation_error} = "Invalid sig may have been passed:". $get_sig . $sig;
+        return 0;
     }
     my $current_time = time;
     my $clock_skew = abs(time - $ts);
     if ($clock_skew >= 600) {
-        $self->sig_validation_error(
-            "Invalid timestamp - clock_skew is $clock_skew seconds, current time is $current_time, ts is $ts"
-        );
-        return;
+        $self->{sig_validation_error} = "Invalid timestamp - clock_skew is $clock_skew seconds, current time is $current_time, ts is $ts";
+        return 0;
     }
-    my $sig_input = $relative_url . $self->secret;
+    my $sig_input = $relative_url . $self->{secret};
     my $calculated_sig = md5_hex($sig_input);
     if ($calculated_sig eq $sig) {
         return 1;
     } else {
-        $self->sig_validation_error(
-            "calculated_sig was $calculated_sig, supplied sig was $sig, sig input was $sig_input"
-        );
-        return;
+        $self->{sig_validation_error} = "calculated_sig was $calculated_sig, supplied sig was $sig, sig input was $sig_input";
+        return 0;
     }
 }
 
@@ -96,61 +90,61 @@ sub _get_access_credentials {
     my $ua = LWP::UserAgent->new;
     my $res = $ua->get($url);
     if ($res->is_error) {
-        $self->access_credentials_error($res->status_line);
-        return;
+        $self->{access_credentials_error} = $res->status_line;
+        return 0;
     }
     my $content = $res->content;
     if ($content =~ m!<ErrorCode>(.+)</ErrorCode>!) {
-        $self->access_credentials_error(
-            "Error code returned in XML response: $1"
-        );
-        return;
+        $self->{access_credentials_error} = "Error code returned in XML response: $1";
+        return 0;
     }
     if ($content =~ /(Y=.*)/) {
         $self->cookie($1);
     } else {
-        $self->access_credentials_error('No cookie found');
-        return;
+        $self->{access_credentials_error} = 'No cookie found';
+        return 0;
     }
     if ($content =~ m!<WSSID>(.+)</WSSID>!) {
         $self->WSSID($1);
     } else {
-        $self->access_credentials_error('No WSSID found');
-        return;
+        $self->{access_credentials_error} = 'No WSSID found';
+        return 0;
     }
     if ($content =~ m!<Timeout>(.+)</Timeout>!) {
         $self->timeout($1);
     } else {
-        $self->access_credentials_error('No timeout found');
-        return;
+        $self->{access_credentials_error} = 'No timeout found';
+        return 0;
     }
     return 1;
 }
 
 sub _access_url {
     my $self = shift;
-    unless (defined $self->token) {
+    unless (defined $self->{token}) {
         my $cgi = CGI->new;
         $self->token($cgi->param('token'));
     }
     my $url = URI->new($WSLOGIN_PREFIX. 'wspwtoken_login');
-    $url->query_form(token => $self->token, appid => $self->appid);
-    $self->_create_auth_url($url);
+    $url->query_form(token => $self->{token}, appid => $self->{appid});
+    return $self->_create_auth_url($url);
 }
 
 sub _create_auth_ws_url {
     my ($self, $url) = @_;
-    unless (defined $self->cookie) {
-        return unless $self->_get_access_credentials;
+    if (!defined($self->{cookie})) {
+        if (!$self->_get_access_credentials) {
+            return 0;
+        }
     }
     unless (ref $url) {
         $url = URI->new($url);
     }
     $url->query_form(
-        WSSID => $self->WSSID,
-        appid => $self->appid,
+        WSSID => $self->{WSSID},
+        appid => $self->{appid},
     );
-    $url->as_string;
+    return $url->as_string;
 }
 
 sub auth_ws_get_call {
@@ -166,14 +160,44 @@ sub auth_ws_post_call {
 sub _auth_ws_call {
     my ($self, $url, $method) = @_;
     $url = $self->_create_auth_ws_url($url);
-    my $ua = LWP::UserAgent->new;
-    $ua->default_header(Cookie => $self->cookie);
-    my $res = $ua->$method($url);
-    if ($res->is_error) {
-        $self->access_credentials_error($res->status_line);
-        return;
+    if (!$url) {
+        return 0;
     }
-    $res->content;
+    my $wscall = LWP::UserAgent->new;
+    $wscall->default_headers->push_header('Cookie' => $self->{cookie});
+    my $res = $wscall->$method($url);
+    if ($res->is_error) {
+        $self->{access_credentials_error} = $res->status_line;
+        return 0;
+    }
+    return $res->content;
+}
+
+sub make_jsonrpc_call {
+    my ($self, $method, $params) = @_;
+    if (!$self->_get_access_credentials) {
+        return 0;
+    }
+
+    my $thecall = { params => $params, method =>  $method  };
+    my $jsonclass = new JSON;
+    my $json = $jsonclass->objToJson($thecall);
+
+    my $url = $JSON_RPC_ENDPOINT . '?appid=' . $self->{appid} . '&WSSID=' . $self->{WSSID};
+
+    my $req = HTTP::Request->new(POST => $url, HTTP::Headers->new, $json); 
+    $req->content_type('application/json'); 
+    $req->content_length(length $json); 
+    $req->header('Cookie' => $self->{cookie});
+
+    my $res = LWP::UserAgent->new->request($req); 
+
+    if ($res->is_error) {
+        $self->{access_credentials_error} = $res->status_line;
+        return 0;
+    }
+
+    return $jsonclass->jsonToObj($res->content);
 }
 
 1;
@@ -185,33 +209,46 @@ Yahoo::BBAuth - Perl interface to the Yahoo! Browser-Based Authentication.
 
 =head1 SYNOPSIS
 
-  my $bbauth = Yahoo::BBAuth->new(
-      appid  => $appid,
-      secret => $secret,
-  );
-  # Create an authentication link
-  printf '<a href="%s">Click here to authorize</a>', $bbauth->auth_url; 
-  # After the user authenticates successfully, Yahoo returns the user to the page you
-  # dictated when you signed up. To verify whether authentication succeeded, you need to
-  # validate the signature:
-  if ($bbauth->validate_sig()) {
-      print 'Authentication Successful';
-  } else {
-      print 'Authentication Failed. Error is: '.$bbauth->sig_validation_error;
-  }
-  my $url = 'http://photos.yahooapis.com/V1.0/listAlbums';
-  my $xml = $bbauth->auth_ws_get_call($url);
-  unless ($xml) {
-      print 'WS call setup Failed. Error is: '. $bbauth->access_credentials_error;
-  } else {
-      print 'Look at response for other errors or success: '.$xml;
-  }
+      my $bbauth = Yahoo::BBAuth->new(
+          appid  => $appid,
+          secret => $secret,
+      );
+      # Get your appid and secret by registering your application here:
+      # https://developer.yahoo.com/wsregapp/index.php
+      # Create an authentication link
+      printf '<a href="%s">Click here to authorize</a>', $bbauth->auth_url; 
+      # You can include some application data or return a user hash using optional params:
+      printf '<a href="%s">Click here to authorize</a>', $bbauth->auth_url(
+          send_userhash  => '1',
+          appdata => 'someappdata',
+          );  
+      # After the user authenticates successfully, Yahoo returns the user to the page you
+      # dictated when you signed up. To verify whether authentication succeeded, you need to
+      # validate the signature:
+      if (!$bbauth->validate_sig()) {
+      print '<h2>Authentication Failed. Error is: </h2>'.$bbauth->{sig_validation_error};
+      exit(0);
+      }
+      # You can then make an authenticated web service call on behalf of the user
+      # For Yahoo! Mail:
+      my $json = $bbauth->make_jsonrpc_call('ListFolders', [{}] );
+      if (!$json) {
+            print '<h2>Web services call failed. Error is:</h2> '. $bbauth->{access_credentials_error};
+            exit(0);
+      }
+      # For Yahoo! Photos:
+      my $url = 'http://photos.yahooapis.com/V3.0/listAlbums?';
+      my $xml = $bbauth->auth_ws_get_call($url);
+      if (!$xml) {
+          print '<h2>Web services call failed. Error is:</h2> '. $bbauth->{access_credentials_error};
+          exit(0);
+      }
 
 =head1 DESCRIPTION
 
-This module priovides you an Object Oriented interface for Yahoo! Browser-Based Authentication.
+This module priovides an Object Oriented interface for Yahoo! Browser-Based Authentication.
 
-This module is ported from official PHP class library(http://developer.yahoo.com/auth/quickstart/bbauth_quickstart.zip).
+This module is ported from the official PHP class which is located on this page: http://developer.yahoo.com/php
 
 =head1 METHODS
 
@@ -225,7 +262,7 @@ You must set the your application id and shared secret.
 Create the Login URL used to fetch authentication credentials.
 This is the first step in the browser authentication process.
 
-You can set the %param to send_userhash and appdata if you need(optinal).
+You can set the %param to send_userhash and appdata if you need(optional).
 
 The appdata typically a session id that Yahoo will transfer to the target application upon successful authentication.
 
@@ -235,26 +272,30 @@ If send_userhash set, the send_userhash=1 request will be appended to the reques
 
 Validates the signature returned by Yahoo's browser authentication services.
 
-Returns true if the sig is validated. Returns undef if any error occurs.
-If undef is returned, $self->sig_validation_error should contain a string describing the error.
+Returns false if the sig is invalid. Returns 0 if any error occurs.
+If 0 is returned, $self->sig_validation_error should contain a string describing the error.
 
 =head2 auth_ws_get_call($url)
 
 Make an authenticated web services call using HTTP GET.
-Returns responce if successful, a string is returned containing the web service response which might be XML, JSON, or some other type of text.
-If an error occurs, the error is stored in $self->access_credentials_error.
+Returns response if successful, a string is returned containing the web service response which might be XML, JSON, or some other type of text.
+If an error occurs, 0 is returned, and the error is stored in $self->access_credentials_error.
 
 =head2 auth_ws_post_call($url)
 
 Make an authenticated web services call using HTTP POST.
 
+=head2 make_jsonrpc_call($method, $params)
+
+Make an authenticated web services JSON-RPC call.
+
 =head2 sig_validation_error
 
-Returns error message when validate_sig failed.
+The error message when validate_sig fails.
 
 =head2 access_credentials_error
 
-Returns error message when auth_ws_get_call or auth_ws_post_call failed.
+The error message when auth_ws_get_call or auth_ws_post_call fail.
 
 =head1 ACCESSORS
 
@@ -278,9 +319,10 @@ Returns error message when auth_ws_get_call or auth_ws_post_call failed.
 
 =back
 
-=head1 AUTHOR
+=head1 AUTHORS
 
-Jiro Nishiguchi E<lt>jiro@cpan.orgE<gt>
+  Jiro Nishiguchi <jiro@cpan.org>
+  Jason Levitt <jlevitt@yahoo-inc.com>
 
 This library is free software; you can redistribute it and/or modify
 it under the same terms as Perl itself.
